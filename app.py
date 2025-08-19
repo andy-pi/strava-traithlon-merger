@@ -1,196 +1,160 @@
-from js import document, FileReader, Blob, URL, enableDnD
-import js, asyncio
-from xml.etree import ElementTree as ET
-from datetime import datetime, timedelta, timezone
-from xml.dom import minidom
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# app.py — browser entry point using PyScript; imports shared logic from core.py
 
-TCX_NS = "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"
-XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
-NS3_NS = "http://www.garmin.com/xmlschemas/ActivityExtension/v2"
-ET.register_namespace("", TCX_NS); ET.register_namespace("xsi", XSI_NS); ET.register_namespace("ns3", NS3_NS)
+import asyncio
+from datetime import datetime
+from pyodide.ffi import create_proxy
 
-# ---------- Utility ----------
-def iso_to_dt(s:str)->datetime:
-    s = s.replace("Z","+00:00")
-    try: return datetime.fromisoformat(s)
-    except Exception: return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")
+from core import (
+    parse_any,
+    iso_to_dt,
+    fmt_dur,
+    build_plan_from_files,
+    build_tcx_from_plan,
+    summary_lines_from_plan, fmt_dt_human
+)
+from js import URL, Blob, FileReader, document, console, window
 
-def dt_to_iso(d:datetime)->str:
-    return d.astimezone(timezone.utc).isoformat().replace("+00:00","Z")
-
-def fmt_dur(seconds: float) -> str:
-    seconds = int(round(seconds))
-    h = seconds // 3600; m = (seconds % 3600) // 60; s = seconds % 60
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
-
-def tcx_root():
-    root = ET.Element(f"{{{TCX_NS}}}TrainingCenterDatabase", {
-        f"{{{XSI_NS}}}schemaLocation": f"{TCX_NS} {TCX_NS.replace('/v2','v2')}"
-    })
-    ET.SubElement(root, "Folders"); ET.SubElement(root, "Activities")
-    return root
-
-def mk(parent, tag, text=None):
-    e = ET.SubElement(parent, tag)
-    if text is not None: e.text = text
-    return e
-
-# ---------- Parsers ----------
-
-def parse_gpx(text:str):
-    root = ET.fromstring(text)
-    gns = {"gpx": root.tag.split('}')[0].strip('{')}
-    pts=[]
-    for tp in root.findall(".//gpx:trkpt", gns):
-        t = tp.findtext("gpx:time", namespaces=gns)
-        la = tp.get("lat"); lo = tp.get("lon")
-        ele = tp.findtext("gpx:ele", namespaces=gns)
-        pts.append({"time": t, "lat": float(la) if la else None, "lon": float(lo) if lo else None,
-                    "ele": float(ele) if ele else None, "hr":None, "cad":None, "pwr":None})
-    return pts
-
-def parse_tcx(text:str):
-    ns = {"tcx": TCX_NS, "ns3": NS3_NS}
-    root = ET.fromstring(text)
-    pts=[]
-    for tp in root.findall(".//tcx:Trackpoint", ns):
-        time = tp.findtext("tcx:Time", namespaces=ns)
-        pos = tp.find("tcx:Position", ns)
-        lat = lon = None
-        if pos is not None:
-            la = pos.findtext("tcx:LatitudeDegrees", namespaces=ns)
-            lo = pos.findtext("tcx:LongitudeDegrees", namespaces=ns)
-            lat = float(la) if la else None; lon = float(lo) if lo else None
-        ele = tp.findtext("tcx:AltitudeMeters", namespaces=ns)
-        hr  = tp.findtext(".//tcx:HeartRateBpm/tcx:Value", namespaces=ns)
-        cad = tp.findtext("tcx:Cadence", namespaces=ns)
-        pwr = tp.findtext(".//ns3:TPX/ns3:Watts", namespaces=ns)
-        pts.append({"time": time, "lat":lat, "lon":lon, "ele": float(ele) if ele else None,
-                    "hr": int(hr) if hr else None, "cad": int(cad) if cad else None,
-                    "pwr": int(pwr) if pwr else None})
-    return pts
-
-def parse_any(name:str, text:str):
-    if name.lower().endswith(".gpx"): return parse_gpx(text)
-    if name.lower().endswith(".tcx"): return parse_tcx(text)
-    raise ValueError("Unsupported file type")
-
-# ---------- Rebase & Emit ----------
-
-def rebase(points, new_start:datetime):
-    if not points: return [], new_start, new_start
-    src0 = iso_to_dt(points[0]["time"])
-    shift = new_start - src0
-    out=[]
-    for p in points:
-        q = dict(p)
-        t = iso_to_dt(p["time"]) + shift
-        q["time"] = dt_to_iso(t)
-        out.append(q)
-    return out, iso_to_dt(out[0]["time"]), iso_to_dt(out[-1]["time"])
-
-SPORT_MAP = {"swim":"Swimming","bike":"Biking","run":"Running","transition":"Other"}
-
-
-def make_activity(start_iso, sport, label, points, stop_iso, lap_distance_m=None):
-    act = ET.Element("Activity", {"Sport": sport})
-    mk(act, "Id", start_iso)
-    lap = ET.SubElement(act, "Lap", {"StartTime": start_iso})
-    total = max(0.0, (iso_to_dt(stop_iso) - iso_to_dt(start_iso)).total_seconds())
-    mk(lap, "TotalTimeSeconds", f"{total:.1f}")
-    mk(lap, "DistanceMeters", f"{float(lap_distance_m):.1f}" if lap_distance_m is not None else "0.0")
-    mk(lap, "MaximumSpeed", "0.0"); mk(lap, "Calories", "0")
-    mk(lap, "Intensity", "Active"); mk(lap, "TriggerMethod", "Manual")
-    trk = ET.SubElement(lap, "Track")
-    for p in points:
-        tp = ET.SubElement(trk, "Trackpoint")
-        mk(tp, "Time", p["time"])
-        if p.get("lat") is not None and p.get("lon") is not None:
-            pos = ET.SubElement(tp, "Position")
-            mk(pos, "LatitudeDegrees", f"{p['lat']:.8f}")
-            mk(pos, "LongitudeDegrees", f"{p['lon']:.8f}")
-        if p.get("ele") is not None: mk(tp, "AltitudeMeters", f"{p['ele']:.2f}")
-        if p.get("hr") is not None:
-            hr = ET.SubElement(tp, "HeartRateBpm"); mk(hr, "Value", str(p["hr"]))
-        if p.get("cad") is not None: mk(tp, "Cadence", str(p["cad"]))
-        if p.get("pwr") is not None:
-            ext = ET.SubElement(tp, "Extensions")
-            tpx = ET.SubElement(ext, f"{{{NS3_NS}}}TPX")
-            mk(tpx, f"{{{NS3_NS}}}Watts", str(p["pwr"]))
-    mk(lap, "Notes", label)
-    return act
-
-# ---------- File Reading & UI ----------
-
-async def read_file(file_obj):
-    fr = FileReader()
-    done = asyncio.get_event_loop().create_future()
-    def onload(ev): done.set_result(fr.result)
-    fr.onload = onload
-    fr.readAsText(file_obj)
-    txt = await done
-    return txt
+# enableDnD may be provided by a separate JS helper; guard absence
+try:
+    from js import enableDnD  # type: ignore
+except Exception:
+    enableDnD = None  # type: ignore
 
 files_cache = []  # list of dicts: {name, role, points, start, stop, count}
+_proxies = []     # keep JS proxies alive to avoid "borrowed proxy destroyed"
+
+# ---------- tiny logger helpers ----------
+def log(*args):
+    try: console.log(*args)
+    except Exception: pass
+
+def warn(*args):
+    try: console.warn(*args)
+    except Exception: pass
+
+def err(*args):
+    try: console.error(*args)
+    except Exception: pass
+
+log("app.py: loaded")
+
+# ---------- File Reading ----------
+async def read_file(file_obj):
+    fr = FileReader.new()  # <-- use .new() in Pyodide
+    done = asyncio.get_event_loop().create_future()
+
+    # proxy the JS callback so it doesn't get GC'd
+    cb = create_proxy(lambda ev: done.set_result(fr.result))
+    fr.onload = cb
+    fr.readAsText(file_obj)
+
+    txt = await done
+    try:
+        cb.destroy()  # optional cleanup
+    except Exception:
+        pass
+    return txt
+
 
 async def scan_click(evt):
-    global files_cache
-    tableWrap = document.getElementById("tableWrap")
-    tbody = document.getElementById("fileTbody")
-    tbody.innerHTML = ""
-    files_cache = []
-    fsel = document.getElementById("files")
-    if not fsel.files.length:
-        document.getElementById("scanStatus").textContent = "Choose GPX/TCX files first."; return
-    document.getElementById("scanStatus").textContent = "Parsing…"
+    log("scan_click: start")
+    try:
+        global files_cache
+        tableWrap = document.getElementById("tableWrap")
+        tbody = document.getElementById("fileTbody")
+        tbody.innerHTML = ""
+        files_cache = []
+        fsel = document.getElementById("files")
+        if fsel is None:
+            err("scan_click: #files input not found")
+            if document.getElementById("scanStatus"):
+                document.getElementById("scanStatus").textContent = "Error: file input not found"
+            return
+        log("scan_click: file input present; count =", fsel.files.length)
+        if not fsel.files.length:
+            if document.getElementById("scanStatus"):
+                document.getElementById("scanStatus").textContent = "Choose GPX/TCX files first."
+            warn("scan_click: no files selected")
+            return
+        if document.getElementById("scanStatus"):
+            document.getElementById("scanStatus").textContent = "Parsing…"
 
-    for i in range(fsel.files.length):
-        f = fsel.files.item(i)
-        text = await read_file(f)
+        for i in range(fsel.files.length):
+            f = fsel.files.item(i)
+            log(f"scan_click: reading file[{i}] name={f.name} size={getattr(f, 'size', 'n/a')}")
+            text = await read_file(f)
+            try:
+                pts = parse_any(f.name, text)
+                start = iso_to_dt(pts[0]["time"]) if pts else None
+                stop  = iso_to_dt(pts[-1]["time"]) if pts else None
+                files_cache.append({
+                    "name": f.name,
+                    "role": guess_role_from_name(f.name),
+                    "points": pts,
+                    "start": start,
+                    "stop": stop,
+                    "count": len(pts),
+                })
+                log(f"scan_click: parsed ok -> {f.name}; points={len(pts)} start={start} stop={stop}")
+            except Exception as e:
+                files_cache.append({
+                    "name": f.name, "role": "ignore",
+                    "points": [], "start": None, "stop": None, "count": 0,
+                })
+                err(f"scan_click: parse failed for {f.name} -> {e}")
+
+        # Sort by start time initially (use datetime.max to avoid mixing types)
+        files_cache.sort(key=lambda x: x["start"] or datetime.max)
+        log("scan_click: sorted files by start")
+
+        for item in files_cache:
+            tr = document.createElement("tr"); tr.classList.add("file-row")
+            drag = document.createElement("td")
+            drag.innerHTML = '<span class="drag-handle">☰</span>'
+            tr.appendChild(drag)
+
+            td_name = document.createElement("td"); td_name.textContent = item["name"]; tr.appendChild(td_name)
+
+            td_role = document.createElement("td")
+            sel = document.createElement("select"); sel.className = "form-select form-select-sm"
+            for r in ["swim","bike","run","transition","ignore"]:
+                opt = document.createElement("option"); opt.value = r; opt.textContent = r.capitalize()
+                if r == item["role"]: opt.selected = True
+                sel.appendChild(opt)
+            td_role.appendChild(sel); tr.appendChild(td_role)
+
+            td_start = document.createElement("td")
+            td_start.textContent = fmt_dt_human(item["start"]) if item["start"] else "—"
+            tr.appendChild(td_start)
+
+            td_end = document.createElement("td")
+            td_end.textContent = fmt_dt_human(item["stop"]) if item["stop"] else "—"
+            tr.appendChild(td_end)
+            dur = (item["stop"] - item["start"]).total_seconds() if item["start"] and item["stop"] else 0
+            td_dur = document.createElement("td"); td_dur.textContent = fmt_dur(dur) if dur else "—"; tr.appendChild(td_dur)
+
+            tr._roleSelect = sel
+            tbody.appendChild(tr)
+
+        # enable drag-and-drop if helper is present
         try:
-            pts = parse_any(f.name, text)
-            start = iso_to_dt(pts[0]["time"]) if pts else None
-            stop  = iso_to_dt(pts[-1]["time"]) if pts else None
-            files_cache.append({
-                "name": f.name,
-                "role": guess_role_from_name(f.name),
-                "points": pts,
-                "start": start,
-                "stop": stop,
-                "count": len(pts),
-            })
-        except Exception:
-            files_cache.append({"name": f.name, "role": "ignore", "points": [], "start": None, "stop": None, "count": 0})
+            if enableDnD:
+                enableDnD("fileTbody")
+                log("scan_click: enableDnD applied")
+            else:
+                warn("scan_click: enableDnD not available; skipping")
+        except Exception as e:
+            warn("scan_click: enableDnD failed:", e)
 
-    # Sort by start time initially
-    files_cache.sort(key=lambda x: x["start"] or datetime.max)
-
-    for item in files_cache:
-        tr = document.createElement("tr"); tr.classList.add("file-row")
-        # drag handle
-        drag = document.createElement("td"); drag.innerHTML = '<span class="drag-handle">☰</span>'; tr.appendChild(drag)
-        td_name = document.createElement("td"); td_name.textContent = item["name"]; tr.appendChild(td_name)
-        td_role = document.createElement("td")
-        sel = document.createElement("select"); sel.className = "form-select form-select-sm"
-        for r in ["swim","bike","run","transition","ignore"]:
-            opt = document.createElement("option"); opt.value = r; opt.textContent = r.capitalize()
-            if r == item["role"]: opt.selected = True
-            sel.appendChild(opt)
-        td_role.appendChild(sel); tr.appendChild(td_role)
-        td_start = document.createElement("td"); td_start.textContent = item["start"].isoformat() if item["start"] else "—"; tr.appendChild(td_start)
-        td_end   = document.createElement("td"); td_end.textContent   = item["stop"].isoformat() if item["stop"] else "—"; tr.appendChild(td_end)
-        dur = (item["stop"] - item["start"]).total_seconds() if item["start"] and item["stop"] else 0
-        td_dur = document.createElement("td"); td_dur.textContent = fmt_dur(dur) if dur else "—"; tr.appendChild(td_dur)
-        td_pts = document.createElement("td"); td_pts.textContent = str(item["count"]); tr.appendChild(td_pts)
-        tr._roleSelect = sel
-        tbody.appendChild(tr)
-
-    # enable drag-and-drop on current rows
-    enableDnD("fileTbody")
-
-    tableWrap.style.display = "block"
-    document.getElementById("scanStatus").textContent = f"Loaded {len(files_cache)} file(s). Drag to set priority and assign roles."
-
+        tableWrap.style.display = "block"
+        if document.getElementById("scanStatus"):
+            document.getElementById("scanStatus").textContent = f"Loaded {len(files_cache)} file(s). Drag to reorder and assign roles."
+        log("scan_click: done; files_cache size =", len(files_cache))
+    except Exception as e:
+        err("scan_click: top-level exception:", e)
+        if document.getElementById("scanStatus"):
+            document.getElementById("scanStatus").textContent = f"Error: {e}"
 
 def guess_role_from_name(name:str) -> str:
     low = name.lower()
@@ -200,10 +164,9 @@ def guess_role_from_name(name:str) -> str:
     if "t1" in low or "t2" in low or "trans" in low: return "transition"
     return "ignore"
 
-
 def collect_roles_from_table():
     tbody = document.getElementById("fileTbody")
-    rows = list(tbody.children)  # in current visual order
+    rows = list(tbody.children)
     roles = []
     for row in rows:
         sel = row._roleSelect
@@ -215,142 +178,93 @@ def collect_roles_from_table():
     roles = [r for r in roles if r["role"] != "ignore" and r["start"] is not None]
     return roles
 
-# ---------- Preview & Build Plan ----------
-
-def build_plan(roles, infer_missing: bool):
-    # The first occurrence (topmost) of each role is chosen when multiple exist
-    swim = next((r for r in roles if r["role"]=="swim"), None)
-    bike = next((r for r in roles if r["role"]=="bike"), None)
-    run  = next((r for r in roles if r["role"]=="run"),  None)
-    if not (swim and bike and run):
-        return None, "Need at least one Swim, one Bike, and one Run (topmost per role is used)."
-
-    # Prefer transition files that fall between the adjacent legs; else infer
-    transitions = [r for r in roles if r["role"]=="transition"]
-    t1_item = next((t for t in transitions if swim["stop"] <= t["start"] <= bike["start"]), None)
-    t2_item = next((t for t in transitions if bike["stop"] <= t["start"] <= run["start"]), None)
-
-    t1_inf = t2_inf = None
-    if infer_missing:
-        if t1_item is None:
-            t1_inf = max(0.0, (bike["start"] - swim["stop"]).total_seconds())
-        if t2_item is None:
-            t2_inf = max(0.0, (run["start"] - bike["stop"]).total_seconds())
-
-    plan = {"swim": swim, "bike": bike, "run": run,
-            "t1_file": t1_item, "t2_file": t2_item,
-            "t1_inferred": t1_inf, "t2_inferred": t2_inf}
-    return plan, None
-
-
-def render_preview(plan):
-    timeline = document.getElementById("timeline")
-    lines = []
-    def line(label, start, stop, extra=""):
-        dur = (stop - start).total_seconds()
-        lines.append(f"{label:<12} {start.isoformat()}  →  {stop.isoformat()}   [{fmt_dur(dur)}] {extra}")
-    s, b, r = plan["swim"], plan["bike"], plan["run"]
-    line("Swim", s["start"], s["stop"], f"{s['count']} pts")
-    if plan["t1_file"]: t=plan["t1_file"]; line("T1 (file)", t["start"], t["stop"], f"{t['count']} pts")
-    elif plan["t1_inferred"] is not None:
-        t1s, t1e = s["stop"], s["stop"] + timedelta(seconds=plan["t1_inferred"]) ; line("T1 (inferred)", t1s, t1e)
-    line("Bike", b["start"], b["stop"], f"{b['count']} pts")
-    if plan["t2_file"]: t=plan["t2_file"]; line("T2 (file)", t["start"], t["stop"], f"{t['count']} pts")
-    elif plan["t2_inferred"] is not None:
-        t2s, t2e = b["stop"], b["stop"] + timedelta(seconds=plan["t2_inferred"]) ; line("T2 (inferred)", t2s, t2e)
-    line("Run", r["start"], r["stop"], f"{r['count']} pts")
-    timeline.innerText = "
-".join(lines)
-    document.getElementById("previewBox").style.display = "block"
-
-# ---------- Build TCX from Plan ----------
-
-def build_tcx_from_plan(plan, compact: bool, swim_dist_m):
-    root = tcx_root(); activities = root.find("Activities"); ids = []
-
-    def add_item(item, sport_key, label, dist=None):
-        act = make_activity(dt_to_iso(item["start"]), SPORT_MAP[sport_key], label, item["points"], dt_to_iso(item["stop"]), lap_distance_m=dist)
-        activities.append(act); ids.append(dt_to_iso(item["start"]))
-
-    if not compact:
-        add_item(plan["swim"], "swim", "Swim", dist=swim_dist_m)
-        if plan["t1_file"]:
-            add_item(plan["t1_file"], "transition", "Transition T1")
-        elif plan["t1_inferred"] is not None:
-            t1s = plan["swim"]["stop"]; t1e = t1s + timedelta(seconds=plan["t1_inferred"]) 
-            pts = [{"time": dt_to_iso(t1s)}, {"time": dt_to_iso(t1e)}]
-            activities.append(make_activity(dt_to_iso(t1s), SPORT_MAP["transition"], "Transition T1", pts, dt_to_iso(t1e))); ids.append(dt_to_iso(t1s))
-        add_item(plan["bike"], "bike", "Bike")
-        if plan["t2_file"]:
-            add_item(plan["t2_file"], "transition", "Transition T2")
-        elif plan["t2_inferred"] is not None:
-            t2s = plan["bike"]["stop"]; t2e = t2s + timedelta(seconds=plan["t2_inferred"]) 
-            pts = [{"time": dt_to_iso(t2s)}, {"time": dt_to_iso(t2e)}]
-            activities.append(make_activity(dt_to_iso(t2s), SPORT_MAP["transition"], "Transition T2", pts, dt_to_iso(t2e))); ids.append(dt_to_iso(t2s))
-        add_item(plan["run"], "run", "Run")
-    else:
-        cursor = plan["swim"]["start"]
-        swim_pts, s0, s1 = rebase(plan["swim"]["points"], cursor)
-        activities.append(make_activity(dt_to_iso(s0), SPORT_MAP["swim"], "Swim", swim_pts, dt_to_iso(s1), lap_distance_m=swim_dist_m)); ids.append(dt_to_iso(s0)); cursor = s1
-        if plan["t1_file"]:
-            t1_pts, t1s, t1e = rebase(plan["t1_file"]["points"], cursor)
-            activities.append(make_activity(dt_to_iso(t1s), SPORT_MAP["transition"], "Transition T1", t1_pts, dt_to_iso(t1e))); ids.append(dt_to_iso(t1s)); cursor = t1e
-        elif plan["t1_inferred"] is not None:
-            t1s = cursor; t1e = t1s + timedelta(seconds=plan["t1_inferred"]) 
-            pts = [{"time": dt_to_iso(t1s)}, {"time": dt_to_iso(t1e)}]
-            activities.append(make_activity(dt_to_iso(t1s), SPORT_MAP["transition"], "Transition T1", pts, dt_to_iso(t1e))); ids.append(dt_to_iso(t1s)); cursor = t1e
-        bike_pts, b0, b1 = rebase(plan["bike"]["points"], cursor)
-        activities.append(make_activity(dt_to_iso(b0), SPORT_MAP["bike"], "Bike", bike_pts, dt_to_iso(b1))); ids.append(dt_to_iso(b0)); cursor = b1
-        if plan["t2_file"]:
-            t2_pts, t2s, t2e = rebase(plan["t2_file"]["points"], cursor)
-            activities.append(make_activity(dt_to_iso(t2s), SPORT_MAP["transition"], "Transition T2", t2_pts, dt_to_iso(t2e))); ids.append(dt_to_iso(t2s)); cursor = t2e
-        elif plan["t2_inferred"] is not None:
-            t2s = cursor; t2e = t2s + timedelta(seconds=plan["t2_inferred"]) 
-            pts = [{"time": dt_to_iso(t2s)}, {"time": dt_to_iso(t2e)}]
-            activities.append(make_activity(dt_to_iso(t2s), SPORT_MAP["transition"], "Transition T2", pts, dt_to_iso(t2e))); ids.append(dt_to_iso(t2s)); cursor = t2e
-        run_pts, r0, r1 = rebase(plan["run"]["points"], cursor)
-        activities.append(make_activity(dt_to_iso(r0), SPORT_MAP["run"], "Run", run_pts, dt_to_iso(r1))); ids.append(dt_to_iso(r0))
-
-    mss = ET.SubElement(activities, "MultiSportSession")
-    first = ET.SubElement(mss, "FirstSport"); ar = ET.SubElement(first, "ActivityRef"); mk(ar, "Id", ids[0])
-    for aid in ids[1:]:
-        ns = ET.SubElement(mss, "NextSport"); ar = ET.SubElement(ns, "ActivityRef"); mk(ar, "Id", aid)
-
-    xml = ET.tostring(root, encoding="utf-8")
-    pretty = minidom.parseString(xml).toprettyxml(indent="  ", encoding="utf-8")
-    return pretty
-
 # ---------- Event handlers ----------
-
 async def preview_click(evt):
+    log("preview_click")
     roles = collect_roles_from_table()
     infer_missing = bool(document.getElementById("infer").checked)
-    plan, err = build_plan(roles, infer_missing)
+    swim = next((r for r in roles if r["role"]=="swim"), None)
+    bike = next((r for r in roles if r["role"]=="bike"), None)
+    run  = next((r for r in roles if r["role"]=="run"), None)
+    t1   = next((r for r in roles if r["role"]=="transition" and swim and swim["stop"] <= r["start"] <= bike["start"]), None)
+    t2   = next((r for r in roles if r["role"]=="transition" and bike and bike["stop"] <= r["start"] <= run["start"]), None)
+
+    plan, err = build_plan_from_files(swim, bike, run, t1, t2, infer_missing=infer_missing)
     if err:
-        document.getElementById("previewStatus").textContent = err; return
-    render_preview(plan)
+        document.getElementById("previewStatus").textContent = err
+        warn("preview_click:", err)
+        return
+
+    lines = summary_lines_from_plan(plan, compact=bool(document.getElementById("compact").checked))
+    document.getElementById("timeline").innerText = "\n".join(lines)
+    document.getElementById("previewBox").style.display = "block"
     document.getElementById("previewStatus").textContent = ""
+    log("preview_click: summary rendered")
 
 async def merge_click(evt):
+    log("merge_click")
     roles = collect_roles_from_table()
     infer_missing = bool(document.getElementById("infer").checked)
     compact = bool(document.getElementById("compact").checked)
     swim_distance_input = document.getElementById("swimDist").value
     swim_dist_m = float(swim_distance_input) if swim_distance_input else None
 
-    plan, err = build_plan(roles, infer_missing)
+    swim = next((r for r in roles if r["role"]=="swim"), None)
+    bike = next((r for r in roles if r["role"]=="bike"), None)
+    run  = next((r for r in roles if r["role"]=="run"), None)
+    t1   = next((r for r in roles if r["role"]=="transition" and swim and swim["stop"] <= r["start"] <= bike["start"]), None)
+    t2   = next((r for r in roles if r["role"]=="transition" and bike and bike["stop"] <= r["start"] <= run["start"]), None)
+
+    plan, err = build_plan_from_files(swim, bike, run, t1, t2, infer_missing=infer_missing)
     if err:
-        document.getElementById("mergeStatus").textContent = err; return
+        document.getElementById("mergeStatus").textContent = err
+        warn("merge_click:", err)
+        return
 
-    xml_bytes = build_tcx_from_plan(plan, compact, swim_dist_m)
-    blob = Blob.new([xml_bytes], { "type": "application/vnd.garmin.tcx+xml" })
-    url = URL.createObjectURL(blob)
-    a = document.createElement("a"); a.href = url; a.download = "triathlon.tcx"; a.click()
-    URL.revokeObjectURL(url)
-    document.getElementById("mergeStatus").textContent = "Done ✔︎  Upload triathlon.tcx to Strava."
+    # Show verification summary BEFORE download
+    document.getElementById("timeline").innerText = "\n".join(summary_lines_from_plan(plan, compact=compact))
+    document.getElementById("previewBox").style.display = "block"
 
-# wire buttons
+    try:
+        xml_bytes = build_tcx_from_plan(plan, compact=compact, swim_dist_m=swim_dist_m)
+        blob = Blob.new([xml_bytes], { "type": "application/vnd.garmin.tcx+xml" })
+        url = URL.createObjectURL(blob)
+        a = document.createElement("a"); a.href = url; a.download = "triathlon.tcx"; a.click()
+        URL.revokeObjectURL(url)
+        document.getElementById("mergeStatus").textContent = "Done ✔︎  Upload triathlon.tcx to Strava."
+        log("merge_click: file built and download triggered")
+    except Exception as e:
+        err("merge_click: build/download failed:", e)
+        document.getElementById("mergeStatus").textContent = f"Error: {e}"
 
-document.getElementById("scan").addEventListener("click", lambda e: asyncio.ensure_future(scan_click(e)))
-document.getElementById("preview").addEventListener("click", lambda e: asyncio.ensure_future(preview_click(e)))
-document.getElementById("merge").addEventListener("click", lambda e: asyncio.ensure_future(merge_click(e)))
+# ---------- Bind handlers with proxies (prevents GC) ----------
+def _bind_handlers(evt=None):
+    log("_bind_handlers: wiring buttons (with proxies)")
+    scan_btn = document.getElementById("scan")
+    prev_btn = document.getElementById("preview")
+    merge_btn = document.getElementById("merge")
+    if not (scan_btn and prev_btn and merge_btn):
+        err("_bind_handlers: one or more buttons not found; check index.html IDs")
+        return
+
+    # Wrap callbacks in pyodide proxies and keep references
+    scan_cb = create_proxy(lambda e: asyncio.ensure_future(scan_click(e)))
+    prev_cb = create_proxy(lambda e: asyncio.ensure_future(preview_click(e)))
+    merge_cb = create_proxy(lambda e: asyncio.ensure_future(merge_click(e)))
+    _proxies.extend([scan_cb, prev_cb, merge_cb])
+
+    scan_btn.addEventListener("click", scan_cb)
+    prev_btn.addEventListener("click", prev_cb)
+    merge_btn.addEventListener("click", merge_cb)
+    log("_bind_handlers: wired")
+
+# If DOM is already ready, bind now; else bind on DOMContentLoaded
+try:
+    rs = document.readyState
+    log("document.readyState =", rs)
+    if rs in ("interactive", "complete"):
+        _bind_handlers()
+    else:
+        window.addEventListener("DOMContentLoaded", create_proxy(_bind_handlers))
+except Exception as e:
+    err("ready/bind failed:", e)
